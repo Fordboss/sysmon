@@ -1,0 +1,8 @@
+build/
+DerivedData/
+*.xcarchive
+*.ipa
+*.xcuserstate
+xcuserdata/
+.DS_Store
+SysMon.xcodeproj/

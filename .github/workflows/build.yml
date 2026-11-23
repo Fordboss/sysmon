@@ -1,0 +1,149 @@
+name: Build Unsigned IPA
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build SysMon
+    # macos-14 已被 GitHub 下线（表现为作业直接 cancelled、0 个 step），
+    # 必须用 macos-15（自带 Xcode 16.x）。
+    runs-on: macos-15
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Install XcodeGen
+        run: |
+          set -euo pipefail
+          if ! command -v xcodegen >/dev/null 2>&1; then
+            brew install xcodegen
+          fi
+          xcodegen --version
+
+      - name: Generate Xcode project
+        run: |
+          set -euo pipefail
+          xcodegen generate
+          echo "--- 仓库结构 ---"
+          ls -la
+          xcodebuild -list -project SysMon.xcodeproj
+
+      - name: Build (archive, unsigned)
+        run: |
+          set -euo pipefail
+          rm -rf build
+          mkdir -p build
+
+          xcodebuild archive \
+            -project SysMon.xcodeproj \
+            -scheme SysMon \
+            -configuration Release \
+            -destination "generic/platform=iOS" \
+            -archivePath "$PWD/build/SysMon.xcarchive" \
+            -derivedDataPath "$PWD/build/DerivedData" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGN_ENTITLEMENTS="" \
+            DEVELOPMENT_TEAM="" \
+            PROVISIONING_PROFILE_SPECIFIER="" \
+            ENABLE_BITCODE=NO \
+            ONLY_ACTIVE_ARCH=NO \
+            -quiet 2>&1 | tee build/xcodebuild.log || {
+              echo "===== 构建失败，下面是完整日志尾部 ====="
+              tail -n 300 build/xcodebuild.log || true
+              exit 1
+            }
+
+      - name: Verify bundle layout
+        run: |
+          set -euo pipefail
+          APP="build/SysMon.xcarchive/Products/Applications/SysMon.app"
+          if [ ! -d "$APP" ]; then
+            echo "::error::找不到 $APP"
+            exit 1
+          fi
+
+          echo "--- .app 内容 ---"
+          ls -la "$APP"
+
+          echo "--- 检查小组件扩展 ---"
+          EXT="$APP/PlugIns/SysMonWidget.appex"
+          if [ ! -d "$EXT" ]; then
+            echo "::error::小组件扩展未嵌入，负一屏会加不出来"
+            find "$APP" -name "*.appex" -maxdepth 3 || true
+            exit 1
+          fi
+          echo "✅ 扩展已嵌入：$EXT"
+          ls -la "$EXT"
+
+          if [ -f "$EXT/Info.plist" ]; then
+            echo "--- 扩展 Info.plist 关键字段 ---"
+            /usr/libexec/PlistBuddy -c "Print :NSExtension:NSExtensionPointIdentifier" "$EXT/Info.plist" \
+              || { echo "::error::扩展 Info.plist 缺少 NSExtensionPointIdentifier"; exit 1; }
+            /usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$EXT/Info.plist" || true
+          else
+            echo "::error::扩展里没有 Info.plist"
+            exit 1
+          fi
+
+          echo "--- 检查 App 图标 ---"
+          if [ -f "$APP/AppIcon60x60@2x.png" ]; then
+            echo "✅ 图标已编译进包"
+          else
+            echo "::warning::包内没有 AppIcon60x60@2x.png，安装后可能是白图标"
+          fi
+
+      - name: Package unsigned IPA
+        id: package
+        run: |
+          set -euo pipefail
+          APP="build/SysMon.xcarchive/Products/Applications/SysMon.app"
+
+          rm -rf build/Payload build/ipa
+          mkdir -p build/Payload build/ipa
+          cp -R "$APP" build/Payload/
+          # 去掉可能残留的签名产物，避免 TrollStore 误判
+          rm -rf build/Payload/SysMon.app/_CodeSignature
+          rm -rf build/Payload/SysMon.app/PlugIns/SysMonWidget.appex/_CodeSignature
+
+          cd build
+          /usr/bin/zip -qry "ipa/SysMon-unsigned.ipa" Payload
+          cd ..
+
+          ls -lh build/ipa/
+          echo "ipa_path=build/ipa/SysMon-unsigned.ipa" >> "$GITHUB_OUTPUT"
+
+          echo "===== IPA 校验（应含 Payload/SysMon.app/PlugIns/SysMonWidget.appex） ====="
+          /usr/bin/unzip -l build/ipa/SysMon-unsigned.ipa | head -n 40
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SysMon-unsigned-ipa
+          path: build/ipa/SysMon-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build/xcodebuild.log
+          if-no-files-found: ignore
+          retention-days: 14
