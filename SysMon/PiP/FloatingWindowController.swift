@@ -204,9 +204,16 @@ final class FloatingWindowController: NSObject, ObservableObject {
                 \.isPictureInPicturePossible,
                 options: [.initial, .new]
             ) { [weak self] _, change in
-                guard let self, change.newValue == true else { return }
-                self.startRendering()
-                if !self.isActive, let c = self.pipController, !c.isPictureInPictureActive {
+                guard change.newValue == true else { return }
+                // KVO 回调可能在非主线程触发，而 self 是 @MainActor 隔离的，
+                // 必须显式跳到主 actor 才能访问状态
+                Task { @MainActor in
+                    guard let self else { return }
+                    self.startRendering()
+                    guard let c = self.pipController,
+                          !self.isActive,
+                          !c.isPictureInPictureActive,
+                          c.isPictureInPicturePossible else { return }
                     c.startPictureInPicture()
                 }
             }
