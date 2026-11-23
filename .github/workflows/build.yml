@@ -108,7 +108,7 @@ jobs:
             echo "::warning::包内没有 AppIcon60x60@2x.png，安装后可能是白图标"
           fi
 
-      - name: Package unsigned IPA
+      - name: Package + ad-hoc sign (TrollStore-ready)
         id: package
         run: |
           set -euo pipefail
@@ -117,25 +117,50 @@ jobs:
           rm -rf build/Payload build/ipa
           mkdir -p build/Payload build/ipa
           cp -R "$APP" build/Payload/
-          # 去掉可能残留的签名产物，避免 TrollStore 误判
-          rm -rf build/Payload/SysMon.app/_CodeSignature
-          rm -rf build/Payload/SysMon.app/PlugIns/SysMonWidget.appex/_CodeSignature
+
+          TARGET="build/Payload/SysMon.app"
+          EXT="$TARGET/PlugIns/SysMonWidget.appex"
+
+          # ── 顺序很重要：先签扩展，再签主 App ──────────────────
+          # 如果先签主 App，扩展改动会让主 App 的签名失效。
+          # 扩展不需要私有 entitlements，用纯 ad-hoc 签即可。
+          echo "--- 签扩展 ---"
+          codesign --force --sign - --timestamp=none "$EXT"
+          codesign -dv "$EXT" 2>&1 | head -5 || true
+
+          # ── 主 App 带 entitlements 签 ────────────────────────
+          # --deep 会把扩展一起重签（会覆盖上面那次），所以这里不用 --deep，
+          # 改为显式签扩展 + 显式签主 App，避免 entitlements 被带到扩展上。
+          echo "--- 签主 App（带 entitlements）---"
+          codesign --force --sign - --timestamp=none \
+            --entitlements SysMon/SysMon.entitlements \
+            "$TARGET"
+
+          echo "--- 验证主 App 签名 ---"
+          codesign -dv --verbose=2 "$TARGET" 2>&1 | head -12 || true
+
+          echo "--- 验证嵌入的 entitlements ---"
+          codesign -d --entitlements :- "$TARGET" 2>&1 | head -30 \
+            || echo "::warning::读取 entitlements 失败"
+
+          echo "--- 验证扩展签名 ---"
+          codesign -dv "$EXT" 2>&1 | head -6 || true
 
           cd build
-          /usr/bin/zip -qry "ipa/SysMon-unsigned.ipa" Payload
+          /usr/bin/zip -qry "ipa/SysMon.ipa" Payload
           cd ..
 
           ls -lh build/ipa/
-          echo "ipa_path=build/ipa/SysMon-unsigned.ipa" >> "$GITHUB_OUTPUT"
+          echo "ipa_path=build/ipa/SysMon.ipa" >> "$GITHUB_OUTPUT"
 
-          echo "===== IPA 校验（应含 Payload/SysMon.app/PlugIns/SysMonWidget.appex） ====="
-          /usr/bin/unzip -l build/ipa/SysMon-unsigned.ipa | head -n 40
+          echo "===== IPA 内容 ====="
+          /usr/bin/unzip -l build/ipa/SysMon.ipa | head -n 40
 
       - name: Upload IPA artifact
         uses: actions/upload-artifact@v4
         with:
-          name: SysMon-unsigned-ipa
-          path: build/ipa/SysMon-unsigned.ipa
+          name: SysMon-ipa
+          path: build/ipa/SysMon.ipa
           if-no-files-found: error
           retention-days: 90
 

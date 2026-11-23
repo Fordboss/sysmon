@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	  这套 entitlements 的目的是让 host_statistics(HOST_CPU_LOAD_INFO) 和
+	  host_statistics64(HOST_VM_INFO64) 能读到「整机」而非仅本进程的数据。
+
+	  说明：
+	  · platform-application —— 以系统应用身份运行，巨魔 CoreTrust 漏洞可坐实
+	  · no-container —— 脱离沙盒，能访问系统级 mach 服务
+	  · get-task-allow —— 允许调试附加，便于抓日志
+	-->
+	<key>platform-application</key>
+	<true/>
+	<key>com.apple.private.security.no-container</key>
+	<true/>
+	<key>com.apple.private.security.container-manager</key>
+	<true/>
+	<key>get-task-allow</key>
+	<true/>
+
+	<!-- 保留沙盒容器路径访问能力（no-container 后仍需读自己的容器） -->
+	<key>com.apple.private.security.storage.AppDataContainers</key>
+	<true/>
+</dict>
+</plist>
