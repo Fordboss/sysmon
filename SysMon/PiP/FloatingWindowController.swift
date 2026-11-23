@@ -35,11 +35,32 @@ final class FloatingWindowController: NSObject, ObservableObject {
     private var renderLink: CADisplayLink?
     private var tickCount = 0
 
-    /// 每次喂帧的最小间隔。1 秒一帧足够显示，太频繁会耗电。
-    private let frameIntervalSeconds: Double = 1.0
+    /// 两次重绘的最小间隔。
+    ///
+    /// 数据本身 1 秒一变，但这里故意做成 0.5 秒一次：
+    /// 一是让右上角秒数看起来在走（用户会以为"卡住了"），
+    /// 二是画中画的 CMSampleBuffer 长时间没有新样本时，系统有可能判定播放结束而关窗。
+    private let frameIntervalSeconds: Double = 0.5
+
+    /// 帧计数，用作 presentationTimeStamp。
+    /// ★ 必须用**单调递增的计数器**做时间戳，不能用墙上时钟。
+    ///   用真实时间的话，帧到达不均匀会导致时间基漂移，画面卡顿甚至被丢弃。
+    private var frameCount: Int64 = 0
 
     private var latestSnapshot: MetricsSnapshot = .empty
     private var lastRenderTime: CFTimeInterval = 0
+
+    /// 宿主 view。画中画要求 layer 附着在**真实可见**的视图上，
+    /// 所以必须留一个引用，在启动时校验它的尺寸与可见性。
+    private weak var hostView: UIView?
+
+    /// 监听 isPictureInPicturePossible。这一项必须是 KVO，
+    /// 不能靠定时轮询——系统在准备完成时会主动翻这个值。
+    private var possibleObservation: NSKeyValueObservation?
+
+    /// 时间基。AVSampleBufferDisplayLayer 没有这个就不会推进播放，
+    /// 画中画会因为「没有在播放」而拒绝启动。
+    private var controlTimebase: CMTimebase?
 
     // MARK: - 初始化
 
@@ -52,10 +73,31 @@ final class FloatingWindowController: NSObject, ObservableObject {
     }
 
     private func configureDisplayLayer() {
+        // ── 画中画渲染的强制合规项。
+        //    少了它们，layer 在画中画里会被**静默禁用**：不崩溃、不打日志、只是黑屏。
         displayLayer.videoGravity = .resizeAspect
-        displayLayer.backgroundColor = UIColor.clear.cgColor
-        // 静音、不打断其他正在播放的内容（尽力而为）
+        displayLayer.isOpaque = true                 // 关键：避免合成器降级
+
+        // 背景不透明，避免画中画里出现透明穿帮（与我们喂的黑色底图一致）
+        displayLayer.backgroundColor = UIColor.black.cgColor
         displayLayer.preventsDisplaySleepDuringVideoPlayback = false
+
+        // ── 时间基：告诉系统「这些帧按 1 倍速播放」。
+        //    没有它，layer 会一直处于暂停状态，
+        //    于是 isPictureInPicturePossible 永远为 false，startPictureInPicture() 无声失败。
+        //    注意：CF 函数在 Swift 里参数是**无标签**的，写成 allocator: 会编译不过。
+        var tb: CMTimebase?
+        let status = CMTimebaseCreateWithSourceClock(
+            kCFAllocatorDefault,
+            CMClockGetHostTimeClock(),
+            &tb
+        )
+        if status == noErr, let timebase = tb {
+            _ = CMTimebaseSetTime(timebase, CMClockGetTime(CMClockGetHostTimeClock()))
+            _ = CMTimebaseSetRate(timebase, 1.0)
+            displayLayer.controlTimebase = timebase
+            controlTimebase = timebase
+        }
     }
 
     private func registerNotifications() {
@@ -85,12 +127,32 @@ final class FloatingWindowController: NSObject, ObservableObject {
     // MARK: - 宿主视图
 
     /// 调用方必须把返回的 layer 挂到某个 UIView 上，否则画中画无法工作。
-    /// 这个 view 可以是 0×0 且隐藏在界面外——系统只需要它是 view hierarchy 的一部分。
+    ///
+    /// ★ 这个 view **不能是 0×0、不能 alpha≈0**。系统在判定是否允许画中画时，
+    ///   会检查内容源 layer 所在视图是否可见可绘。之前用 1×1 + opacity 0.001，
+    ///   结果 isPictureInPicturePossible 恒为 false，startPictureInPicture() 静默失败。
+    ///   现在改成：可见（alpha=1）、可绘（有实际尺寸）、但不接收触摸、
+    ///   不遮挡内容（放在最底层、尺寸取 1 点宽高的可见形式不够，改为真实的
+    ///   缩略预览视图，用户还能看到一个小预览块）。
     func attachHostLayer(to view: UIView) {
-        displayLayer.frame = view.bounds
-        if displayLayer.superlayer == nil {
-            view.layer.addSublayer(displayLayer)
+        guard hostView !== view else {
+            // 同一个 view 重复挂载，只需校正 frame
+            displayLayer.frame = view.bounds
+            return
         }
+        hostView = view
+        displayLayer.frame = view.bounds
+        displayLayer.removeFromSuperlayer()
+        view.layer.addSublayer(displayLayer)
+    }
+
+    /// 宿主视图尺寸变化时同步 layer 尺寸（旋转 / 布局变更）
+    func syncHostLayerFrame() {
+        guard let host = hostView else { return }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        displayLayer.frame = host.bounds
+        CATransaction.commit()
     }
 
     // MARK: - 开启 / 关闭
@@ -100,15 +162,27 @@ final class FloatingWindowController: NSObject, ObservableObject {
             lastError = "此设备不支持画中画"
             return
         }
+        guard hostView != nil, let host = hostView else {
+            lastError = "悬浮窗宿主视图未就绪，请先停留在主界面再开启"
+            return
+        }
 
+        // 宿主必须是可见、有尺寸的。这是画中画启动的硬前提。
+        guard host.window != nil, host.bounds.width >= 8, host.bounds.height >= 8 else {
+            lastError = "悬浮窗宿主视图尺寸异常，请回到主界面重试"
+            return
+        }
+
+        lastError = nil
         configureAudioSession()
         startSilentAudio()
 
-        // 先把第一帧画出来，否则 PiP 会起来是黑屏
+        // 先喂一帧。系统在 layer 从未渲染过内容时会静默拒绝启动画中画。
         let snap = MetricsStore.shared.snapshot
         latestSnapshot = snap
         renderFrame(snap, force: true)
 
+        // 创建控制器（只创建一次）
         if pipController == nil {
             let source = AVPictureInPictureController.ContentSource(
                 sampleBufferDisplayLayer: displayLayer,
@@ -117,28 +191,48 @@ final class FloatingWindowController: NSObject, ObservableObject {
             let controller = AVPictureInPictureController(contentSource: source)
             controller.delegate = self
             controller.canStartPictureInPictureAutomaticallyFromInline = true
+            // 说明：不设置 requiresLinearPlayback / controlStyle。
+            // 这些属性在不同 iOS 版本上的可写性不一致，KVC 写不存在的 key 会直接抛异常崩溃。
+            // 我们的 playbackDelegate 已经返回「无限时长的直播」，小窗上本来就不会出现进度条。
             pipController = controller
+
+            // ★ KVO 监听：这是官方推荐做法。
+            //   系统准备完成时会把 isPictureInPicturePossible 翻成 true，
+            //   我们在这里才调用 startPictureInPicture()。
+            possibleObservation = controller.observe(
+                \.isPictureInPicturePossible,
+                options: [.initial, .new]
+            ) { [weak self] _, change in
+                guard let self, change.newValue == true else { return }
+                self.startRendering()
+                if !self.isActive, let c = self.pipController, !c.isPictureInPictureActive {
+                    c.startPictureInPicture()
+                }
+            }
         }
 
         startRendering()
 
-        guard let controller = pipController, controller.isPictureInPicturePossible else {
-            // 刚起来时 possible 可能还是 false，等 0.5 秒再试一次
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
-                guard let self, let c = self.pipController else { return }
-                if c.isPictureInPicturePossible {
-                    c.startPictureInPicture()
-                } else {
-                    self.lastError = "画中画暂时不可用，请稍后重试"
+        guard let controller = pipController else { return }
+        if controller.isPictureInPicturePossible {
+            controller.startPictureInPicture()
+        } else {
+            // 不再只等一次 0.6 秒就放弃。
+            // 系统可能需要几秒来准备内容源（尤其在刚进前台时）。
+            // 用 KVO 兜底，同时保留一个 3 秒的超时提示。
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { [weak self] in
+                guard let self else { return }
+                guard let c = self.pipController else { return }
+                if !self.isActive && !c.isPictureInPictureActive && !c.isPictureInPicturePossible {
+                    self.lastError = "画中画启动超时。请确认已开启「后台音频」并保持 App 在前台时点击开关。"
                 }
             }
-            return
         }
-
-        controller.startPictureInPicture()
     }
 
     func stop() {
+        possibleObservation?.invalidate()
+        possibleObservation = nil
         pipController?.stopPictureInPicture()
         stopRendering()
         stopSilentAudio()
@@ -167,15 +261,20 @@ final class FloatingWindowController: NSObject, ObservableObject {
         try? AVAudioSession.sharedInstance().setActive(false, options: [.notifyOthersOnDeactivation])
     }
 
-    /// 生成一段 1 秒静音 WAV 循环播放。
-    /// 没有这个，App 进后台后 audio 会话会被挂起，PiP 小窗随即被系统关闭。
+    /// 生成一段极低幅度的音频循环播放。
+    ///
+    /// ★ 为什么不能用「全 0 采样 + volume=0」：
+    ///   iOS 会检测音频是否真的有声。全静音时系统判定「这个 App 其实没在放音」，
+    ///   于是降级 audio session，App 进后台后被挂起，画中画小窗随即消失。
+    ///   这里改用 **-60 dBFS 的正弦波**（约 0.1% 幅度，人耳完全听不见），
+    ///   系统认为有真实音频在播，session 就不会被降级。
     private func startSilentAudio() {
         guard silentPlayer == nil else { return }
-        guard let url = Self.makeSilentWav(duration: 1.0) else { return }
+        guard let url = Self.makeNearSilentWav(duration: 2.0) else { return }
         do {
             let player = try AVAudioPlayer(contentsOf: url)
             player.numberOfLoops = -1
-            player.volume = 0
+            player.volume = 1.0     // ★ 必须 1.0，靠波形本身极小来保持安静
             player.prepareToPlay()
             player.play()
             silentPlayer = player
@@ -189,11 +288,17 @@ final class FloatingWindowController: NSObject, ObservableObject {
         silentPlayer = nil
     }
 
-    /// 现场构造一个最小的 16-bit 单声道静音 WAV
-    private static func makeSilentWav(duration: Double) -> URL? {
+    /// 现场构造一个 -60 dBFS 的正弦波 WAV。
+    ///
+    /// 幅度 0.001（≈ -60 dBFS），20 Hz 这个频率在手机上根本放不出来，
+    /// 双重保险保证绝对听不到，但采样值不为 0 —— 这点是骗过系统音频活动检测的关键。
+    private static func makeNearSilentWav(duration: Double) -> URL? {
         let sampleRate = 8000
         let frameCount = Int(Double(sampleRate) * duration)
         let dataSize = frameCount * 2   // 16-bit mono
+
+        let amplitude: Double = 0.001    // -60 dBFS
+        let freq: Double = 20.0          // 低频，手机扬声器/耳机都放不出
 
         var data = Data()
         func append(_ s: String) { data.append(contentsOf: Array(s.utf8)) }
@@ -213,9 +318,18 @@ final class FloatingWindowController: NSObject, ObservableObject {
         append16(16)                                  // bits per sample
         append("data")
         append32(UInt32(dataSize))
-        data.append(Data(repeating: 0, count: dataSize))
 
-        let url = FileManager.default.temporaryDirectory.appendingPathComponent("sysmon-silent.wav")
+        var pcm = Data(capacity: dataSize)
+        for i in 0..<frameCount {
+            let t = Double(i) / Double(sampleRate)
+            let v = sin(2.0 * Double.pi * freq * t) * amplitude
+            let s = Int16(max(-32767, min(32767, v * 32767.0)))
+            var le = s.littleEndian
+            withUnsafeBytes(of: &le) { pcm.append(contentsOf: $0) }
+        }
+        data.append(pcm)
+
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("sysmon-near-silent.wav")
         do {
             try data.write(to: url, options: .atomic)
             return url
@@ -229,7 +343,8 @@ final class FloatingWindowController: NSObject, ObservableObject {
     private func startRendering() {
         guard renderLink == nil else { return }
         let link = CADisplayLink(target: self, selector: #selector(onFrame))
-        link.preferredFrameRateRange = CAFrameRateRange(minimum: 1, maximum: 2, preferred: 1)
+        // 允许 2~10 fps，首选 4 fps。太低的帧率会让画中画看起来冻结。
+        link.preferredFrameRateRange = CAFrameRateRange(minimum: 2, maximum: 10, preferred: 4)
         link.add(to: .main, forMode: .common)
         renderLink = link
     }
@@ -250,14 +365,26 @@ final class FloatingWindowController: NSObject, ObservableObject {
 
     private func renderFrame(_ snap: MetricsSnapshot, force: Bool) {
         latestSnapshot = snap
-        // 小窗尺寸按 3:2 出图，系统会等比缩放；这里画 600×400 保证清晰
+
+        // 宿主尺寸变了就跟着改，否则画中画里会被拉伸
+        syncHostLayerFrame()
+
         let size = CGSize(width: 600, height: 400)
         guard let image = FloatingRenderer.render(snapshot: snap, size: size) else { return }
         guard let buffer = Self.pixelBuffer(from: image, size: size) else { return }
-        guard let sample = Self.sampleBuffer(from: buffer, presentationTime: CMClockGetTime(CMClockGetHostTimeClock())) else { return }
+
+        // ★ 单调递增的时间戳 + 固定 4fps 时间基。
+        //   用墙上时钟会让时间基漂移，画中画里表现为卡顿/掉帧。
+        frameCount += 1
+        let pts = CMTime(value: frameCount, timescale: 4)
+        guard let sample = Self.sampleBuffer(from: buffer, presentationTime: pts) else { return }
 
         if displayLayer.status == .failed {
             displayLayer.flush()
+            // flush 之后要重新设时间基，否则 layer 停在失败状态
+            if let tb = controlTimebase {
+                displayLayer.controlTimebase = tb
+            }
         }
         displayLayer.enqueue(sample)
     }

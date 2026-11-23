@@ -10,9 +10,18 @@ struct MetricsEntry: TimelineEntry {
 
 // MARK: - Provider
 
-/// 负一屏小组件的刷新完全由系统调度（通常 1～15 分钟一次，
-/// 受 App 使用频率、电量、低电量模式影响），**做不到**主界面那样的 1 秒节拍。
-/// 所以这里给多条 entry，让系统在两次刷新之间也能自动翻页显示"较新"的读数。
+/// 负一屏小组件的刷新完全由系统调度。
+///
+/// ★ 这是 iOS 的硬限制，不是本 App 的实现问题：
+///   系统给每个小组件分配的刷新预算大致是「每天 40~70 次」，
+///   折算下来平均 **15~30 分钟才刷新一次**，最快也不会快于 1 分钟。
+///   Apple 刻意如此设计以控制耗电，任何第三方 App 都无法突破。
+///
+///   所以这里不再伪造「看起来在动」的假象（旧版本给 3 条时间戳不同、
+///   数据却完全相同的 entry，会让人误以为在实时更新），改为：
+///   如实显示这份数据是**几点几分几秒**采到的，超过 2 分钟就标「已过期」。
+///
+///   想要真正的秒级实时，用锁屏 Live Activity 或画中画小窗。
 struct Provider: TimelineProvider {
 
     /// 负一屏编辑界面里的占位样式，不跑真实采样
@@ -30,25 +39,15 @@ struct Provider: TimelineProvider {
         completion(MetricsEntry(date: Date(), snapshot: snap))
     }
 
-    /// 真正的刷新时刻。系统调用这里后，我们给 3 条 entry（0 / 20 / 40 秒），
-    /// 然后请求 60 秒后再来一次。
+    /// 真正的刷新时刻。采样一次，然后请求 1 分钟后再次刷新。
+    /// 系统大概率会推迟（可能推迟到十几分钟后），这是预期行为。
     func getTimeline(in context: Context, completion: @escaping (Timeline<MetricsEntry>) -> Void) {
-        var entries: [MetricsEntry] = []
-        var latest = MetricsSnapshot.sample
+        let snap = SystemMetricsSampler.shared.sampleInstantaneous()
+        let entry = MetricsEntry(date: Date(), snapshot: snap)
 
-        for index in 0..<3 {
-            // 只有第一条真正打一次差分采样（会阻塞 200ms），
-            // 后面几条复用同一份数据，只推后时间戳——避免白白多阻塞 400ms
-            if index == 0 {
-                latest = SystemMetricsSampler.shared.sampleInstantaneous()
-            }
-            let date = Date().addingTimeInterval(Double(index) * 20)
-            entries.append(MetricsEntry(date: date, snapshot: latest))
-        }
-
-        // 60 秒后再刷新。系统可能推迟，但不会早于这个时间
+        // 60 秒是系统允许的最短请求间隔；实际会按预算推迟
         let next = Date().addingTimeInterval(60)
-        completion(Timeline(entries: entries, policy: .after(next)))
+        completion(Timeline(entries: [entry], policy: .after(next)))
     }
 }
 
@@ -96,9 +95,11 @@ struct SysMonWidgetView: View {
                     .font(.system(size: 11, weight: .semibold))
                     .foregroundColor(.white.opacity(0.55))
                 Spacer(minLength: 2)
-                Text(timeText)
-                    .font(.system(size: 10, weight: .medium).monospacedDigit())
-                    .foregroundColor(.white.opacity(0.35))
+                Text(stampText)
+                    .font(.system(size: 9, weight: .medium).monospacedDigit())
+                    .foregroundColor(isStale ? Color.orange.opacity(0.75) : .white.opacity(0.35))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.8)
             }
             .padding(.bottom, 7)
 
@@ -156,9 +157,10 @@ struct SysMonWidgetView: View {
                     .font(.system(size: 10, weight: .medium))
                     .foregroundColor(.white.opacity(0.3))
                     .lineLimit(1)
-                Text(timeText)
-                    .font(.system(size: 10, weight: .medium).monospacedDigit())
-                    .foregroundColor(.white.opacity(0.35))
+                Text(stampText)
+                    .font(.system(size: 9, weight: .medium).monospacedDigit())
+                    .foregroundColor(isStale ? Color.orange.opacity(0.75) : .white.opacity(0.35))
+                    .lineLimit(1)
             }
             .padding(.bottom, 8)
 
@@ -241,10 +243,24 @@ struct SysMonWidgetView: View {
         return Fmt.percent(cpu)
     }
 
+    /// 数据采集时刻，精确到秒。
+    /// 用 snap.timestamp 而不是 entry.date —— 后者只是「这条 entry 计划显示的时间」，
+    /// 采样真正发生的时刻才是有意义的。
     private var timeText: String {
         let f = DateFormatter()
-        f.dateFormat = "HH:mm"
-        return f.string(from: entry.date)
+        f.dateFormat = "HH:mm:ss"
+        return f.string(from: snap.timestamp)
+    }
+
+    /// 数据是否已经过期（超过 2 分钟）。
+    /// 小组件本来就刷新慢，不明确标出来的话，用户会以为读数坏了。
+    private var isStale: Bool {
+        Date().timeIntervalSince(snap.timestamp) > 120
+    }
+
+    /// 顶部那行状态文字：「12:34:56 采集」或「12:34:56 · 已过期」
+    private var stampText: String {
+        isStale ? "\(timeText) · 已过期" : "\(timeText) 采集"
     }
 }
 

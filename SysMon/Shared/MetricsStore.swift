@@ -23,7 +23,7 @@ final class MetricsStore: ObservableObject {
     /// 是否正在实时采样
     @Published private(set) var isRunning = false
 
-    private var timer: Timer?
+    private var timer: DispatchSourceTimer?
     private let sampler = SystemMetricsSampler.shared
     private let maxHistory = 60
 
@@ -39,16 +39,24 @@ final class MetricsStore: ObservableObject {
         // 先同步采一次，界面不用等 1 秒才有数
         tick()
 
-        let t = Timer(timeInterval: interval, repeats: true) { [weak self] _ in
+        // ★ 用 DispatchSourceTimer 而不是 Timer。
+        //   RunLoop 的 Timer 在 App 进后台后会停摆，导致画中画小窗上的数字冻结。
+        //   DispatchSourceTimer 跑在指定队列上，配合后台 audio 模式可以持续触发。
+        let source = DispatchSource.makeTimerSource(queue: .main)
+        source.schedule(deadline: .now() + interval,
+                        repeating: interval,
+                        leeway: .milliseconds(50))
+        source.setEventHandler { [weak self] in
+            // tick() 是 @MainActor 隔离的，不能从非隔离闭包同步调用，
+            // 必须显式跳到主 actor（虽然队列已经是 main，但编译器不认这点）
             Task { @MainActor in self?.tick() }
         }
-        // .common 让它在滚动视图拖动时也继续走，否则数值会"卡住"
-        RunLoop.main.add(t, forMode: .common)
-        timer = t
+        source.resume()
+        timer = source
     }
 
     func stop() {
-        timer?.invalidate()
+        timer?.cancel()
         timer = nil
         isRunning = false
     }

@@ -27,13 +27,6 @@ struct ContentView: View {
                     .padding(.bottom, 28)
                 }
                 .scrollIndicators(.hidden)
-
-                // 画中画的宿主视图：必须是层级里真实存在的一个 view，
-                // 但可以完全透明、尺寸为 1×1，用户看不到它。
-                PiPHostView()
-                    .frame(width: 1, height: 1)
-                    .opacity(0.001)
-                    .allowsHitTesting(false)
             }
             .navigationTitle("系统监视")
             .navigationBarTitleDisplayMode(.inline)
@@ -230,7 +223,12 @@ struct ContentView: View {
                 Toggle(isOn: Binding<Bool>(
                     get: { floating.isActive },
                     set: { (wantOn: Bool) in
-                        if wantOn { floating.start() } else { floating.stop() }
+                        if wantOn {
+                            // 开之前先把宿主挂上，否则 start() 找不到可见的 layer
+                            floating.start()
+                        } else {
+                            floating.stop()
+                        }
                     }
                 )) {
                     VStack(alignment: .leading, spacing: 2) {
@@ -245,10 +243,23 @@ struct ContentView: View {
                 .tint(Color(red: 0.31, green: 0.85, blue: 0.55))
                 .disabled(!floating.isSupported)
 
+                // 宿主预览：92×62（3:2），必须真实可见，画中画才能启动
+                HStack(spacing: 10) {
+                    PiPHostView()
+                        .frame(width: 92, height: 62)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                .stroke(Color.white.opacity(0.12), lineWidth: 1)
+                        )
+                    Text("小窗预览")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                }
+
                 if !floating.isSupported {
                     noteText("此设备或系统版本不支持画中画", color: .orange)
                 } else if floating.isActive {
-                    noteText("小窗已开启。听音乐时如被抢占，点这里关闭即可恢复。", color: .secondary)
+                    noteText("小窗已开启。离开 App 后仍会显示。", color: .secondary)
                 } else {
                     noteText("开启后系统会占用音频通道，音乐 App 可能被短暂顶掉。", color: .secondary)
                 }
@@ -439,14 +450,28 @@ private struct Sparkline: View {
 
 // MARK: - 画中画宿主
 
-/// 只有把 `AVSampleBufferDisplayLayer` 挂进真实视图层级，画中画才会工作。
-/// 这个视图本身不需要可见。
+/// 画中画的宿主视图。
+///
+/// ★ 关键约束（踩过的坑）：这个 view **必须是真实可见、有实际尺寸**的。
+///   之前写成 1×1 + opacity 0.001，系统判定内容源不可见可绘，
+///   于是 `isPictureInPicturePossible` 恒为 false，`startPictureInPicture()`
+///   静默失败 —— 表现就是「打开开关完全没反应」。
+///
+///   现在它显示成一个 3:2 的小预览块（约 96×64），
+///   既满足系统的可见性要求，又能让用户开之前就看到小窗长什么样。
+///   放在卡片里，正常参与布局，不遮挡任何内容。
 private struct PiPHostView: UIViewRepresentable {
 
     func makeUIView(context: Context) -> UIView {
         let view = HostView()
-        view.backgroundColor = .clear
+        // 不接收触摸，避免挡住下面的开关
         view.isUserInteractionEnabled = false
+        // 必须 alpha = 1。alpha 极低会让系统认为不可见。
+        view.alpha = 1
+        view.clipsToBounds = true
+        view.layer.cornerRadius = 8
+        view.layer.cornerCurve = .continuous
+        view.backgroundColor = UIColor(red: 0.05, green: 0.05, blue: 0.07, alpha: 1)
         return view
     }
 
@@ -460,8 +485,14 @@ private struct PiPHostView: UIViewRepresentable {
             reattach()
         }
 
+        override func layoutSubviews() {
+            super.layoutSubviews()
+            FloatingWindowController.shared.syncHostLayerFrame()
+        }
+
         func reattach() {
             guard window != nil else { return }
+            guard bounds.width >= 8, bounds.height >= 8 else { return }
             FloatingWindowController.shared.attachHostLayer(to: self)
         }
     }

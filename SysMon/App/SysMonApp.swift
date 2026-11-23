@@ -28,11 +28,15 @@ struct SysMonApp: App {
                         MetricsStore.shared.handleForeground()
                     case .background:
                         // 采样继续跑：画中画小窗需要实时数据。
-                        // 关掉定时器会让小窗上的数字冻住。
+                        // 靠 UIBackgroundModes=audio + 持续播放极低幅度音频维持进程不被挂起。
                         if floating.isActive {
                             MetricsStore.shared.start()
                         }
-                    default:
+                    case .inactive:
+                        // inactive 是过渡态（下拉通知栏、来电横幅都会触发），
+                        // 这里什么都不做，避免误把采样停掉
+                        break
+                    @unknown default:
                         break
                     }
                 }
