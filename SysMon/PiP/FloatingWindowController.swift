@@ -59,22 +59,25 @@ final class FloatingWindowController: NSObject, ObservableObject {
     }
 
     private func registerNotifications() {
+        // 这两个通知的 Swift 名字在不同 SDK 上导入结果不一致
+        // （有时是 AVPictureInPictureController.didStart…，有时只保留全局常量），
+        // 直接用原始字符串最保险。
         NotificationCenter.default.addObserver(
             self,
             selector: #selector(handlePipStart),
-            name: AVPictureInPictureController.didStartPictureInPictureNotification,
+            name: Notification.Name("AVPictureInPictureControllerDidStartPictureInPictureNotification"),
             object: nil
         )
         NotificationCenter.default.addObserver(
             self,
             selector: #selector(handlePipStop),
-            name: AVPictureInPictureController.didStopPictureInPictureNotification,
+            name: Notification.Name("AVPictureInPictureControllerDidStopPictureInPictureNotification"),
             object: nil
         )
         NotificationCenter.default.addObserver(
             self,
             selector: #selector(handlePipRestore),
-            name: AVPictureInPictureController.requiresLinearPlaybackForSeekingInVideoNotification,
+            name: Notification.Name("AVPictureInPictureControllerFailedToStartPictureInPictureNotification"),
             object: nil
         )
     }
