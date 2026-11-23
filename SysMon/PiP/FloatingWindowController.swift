@@ -85,16 +85,17 @@ final class FloatingWindowController: NSObject, ObservableObject {
         // ── 时间基：告诉系统「这些帧按 1 倍速播放」。
         //    没有它，layer 会一直处于暂停状态，
         //    于是 isPictureInPicturePossible 永远为 false，startPictureInPicture() 无声失败。
-        //    注意：CF 函数在 Swift 里参数是**无标签**的，写成 allocator: 会编译不过。
+        //    注意：这几个 CF 函数在当前 SDK 的 Swift 导入里**要求带参数标签**，
+        //    写成位置参数会报 missing argument labels。
         var tb: CMTimebase?
         let status = CMTimebaseCreateWithSourceClock(
-            kCFAllocatorDefault,
-            CMClockGetHostTimeClock(),
-            &tb
+            allocator: kCFAllocatorDefault,
+            sourceClock: CMClockGetHostTimeClock(),
+            timebaseOut: &tb
         )
         if status == noErr, let timebase = tb {
-            _ = CMTimebaseSetTime(timebase, CMClockGetTime(CMClockGetHostTimeClock()))
-            _ = CMTimebaseSetRate(timebase, 1.0)
+            _ = CMTimebaseSetTime(timebase, time: CMClockGetTime(CMClockGetHostTimeClock()))
+            _ = CMTimebaseSetRate(timebase, rate: 1.0)
             displayLayer.controlTimebase = timebase
             controlTimebase = timebase
         }
