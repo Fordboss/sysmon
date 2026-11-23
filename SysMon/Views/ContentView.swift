@@ -99,7 +99,9 @@ struct ContentView: View {
                               color: Color(red: 0.42, green: 0.55, blue: 1.0),
                               text: Fmt.percent(cpu))
                     VStack(alignment: .leading, spacing: 8) {
-                        detailRow("历史曲线", "")
+                        Text("历史曲线")
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundStyle(.secondary)
                         Sparkline(values: store.history,
                                   color: Color(red: 0.42, green: 0.55, blue: 1.0))
                             .frame(height: 44)
@@ -225,9 +227,9 @@ struct ContentView: View {
     private var floatingCard: some View {
         MetricCard(title: "悬浮小窗", accent: Color.white.opacity(0.75)) {
             VStack(alignment: .leading, spacing: 12) {
-                Toggle(isOn: Binding(
+                Toggle(isOn: Binding<Bool>(
                     get: { floating.isActive },
-                    set: { wantOn in
+                    set: { (wantOn: Bool) in
                         if wantOn { floating.start() } else { floating.stop() }
                     }
                 )) {
@@ -338,13 +340,8 @@ private struct MetricCard<Content: View>: View {
     }
 }
 
-private extension MetricCard {
-    init(title: String, accent: Color, @ViewBuilder content: () -> Content) {
-        self.title = title
-        self.accent = accent
-        self.content = content()
-    }
-}
+// 注意：MetricCard 的 @ViewBuilder content 属性会自动合成带 builder 的 memberwise init，
+// 这里不需要再手写一个 init —— 手写会与合成的那个冲突（invalid redeclaration）。
 
 // MARK: - 环形进度
 
